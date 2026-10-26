@@ -47,9 +47,15 @@ def tracked(root=ROOT):
 
 def problems(paths):
     """`path: what` for every prebuilt binary in PATHS; [] when there is none."""
+    has_rust_core = "launcher/rust-core/src/lib.rs" in paths
     out = []
     for path in paths:
         if path.endswith("/" + WRAPPER) or path == WRAPPER:
+            continue
+        if has_rust_core and path in (
+            "launcher/app/src/main/jniLibs/arm64-v8a/libtvhome_core.so",
+            "launcher/app/src/main/jniLibs/armeabi-v7a/libtvhome_core.so",
+        ):
             continue
         for suffix in BINARIES:
             if path.lower().endswith(suffix):

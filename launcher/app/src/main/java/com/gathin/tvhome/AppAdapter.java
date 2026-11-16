@@ -563,7 +563,6 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder>
                     }
                 }
             }
-            RustCore.releaseBuffers();
             handler.post(this);
             return;
         }
@@ -1254,7 +1253,7 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder>
         if (live == null) return 0xFF444444;
         Bitmap src = live instanceof BitmapDrawable ? ((BitmapDrawable) live).getBitmap() : null;
         if (src != null && src.getConfig() != Bitmap.Config.HARDWARE && RustCore.AVAILABLE) {
-            int fast = RustCore.vividColor(src);
+            int fast = RustCore.vivid(src);
             if (fast != 0) return fast;
         }
         Bitmap bmp = rasterize(live, 12);
@@ -1266,7 +1265,7 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder>
 
     static int vividColor(Bitmap src) {
         if (RustCore.AVAILABLE && src.getConfig() != Bitmap.Config.HARDWARE) {
-            int fast = RustCore.vividColor(src);
+            int fast = RustCore.vivid(src);
             if (fast != 0) return fast;
         }
         int n = 12;

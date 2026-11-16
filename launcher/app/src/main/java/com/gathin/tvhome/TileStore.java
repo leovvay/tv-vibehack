@@ -13,6 +13,9 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.Buffer;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -20,7 +23,8 @@ import java.util.Set;
 
 /**
  * The tiles of the last load, kept on disk so a cold start can show them without opening any other app's APK.
- * A small index plus one PNG per tile in the cache directory. Used only from {@link AppLoader}'s worker.
+ * A small index plus one file per tile in the cache directory: LZ4 with {@link RustCore}, raw pixels without it,
+ * PNG from older stores. Used only from {@link AppLoader}'s worker.
  *
  * A missing, old or damaged store is ignored, never an error: the normal load builds the tiles and saves them again.
  */
@@ -29,6 +33,9 @@ final class TileStore {
     private static final int MAGIC = 0x54494C45;   // "TILE"
     private static final int VERSION = 4;
     private static final String INDEX = "index";
+    /** A tile written without the native library: a 12-byte header, then the pixels as the Bitmap holds them. */
+    private static final int RAW_MAGIC = 0x54524157;   // "TRAW"
+    private static final int RAW_HEADER = 12;
 
     /** One saved tile: the banner, or the icon of an app without one. */
     static final class Tile {
@@ -72,6 +79,7 @@ final class TileStore {
     private int written;
 
     TileStore(Context app) {
+        RustCore.arm(app);
         dir = new File(app.getCacheDir(), "tiles");
     }
 
@@ -103,35 +111,45 @@ final class TileStore {
         // AppAdapter migrates banners to HARDWARE off the UI thread right after Frame 1.
         int count = c.tiles.size();
         if (RustCore.AVAILABLE && count > 0) {
-            try {
-                boolean packed = RustCore.loadPackLz4(new File(dir, "pack.lz4").getPath()) == count;
-                for (int i = 0; i < count; i++) {
-                    Tile t = c.tiles.get(i);
-                    if (!t.file.endsWith(".lz4")) continue;
-                    String path = packed ? null : new File(dir, t.file).getPath();
-                    int tw = c.width, th = c.height;
-                    if (!t.banner) {
-                        long hdr = packed ? RustCore.readPackHeader(i) : RustCore.readBitmapLz4Header(path);
-                        tw = (int) ((hdr >>> 16) & 0xFFFF);
-                        th = (int) (hdr & 0xFFFF);
+            synchronized (RustCore.LOCK) {
+                RustCore.begin();
+                try {
+                    boolean packed = RustCore.loadPackLz4(new File(dir, "pack.lz4").getPath()) == count;
+                    for (int i = 0; i < count; i++) {
+                        Tile t = c.tiles.get(i);
+                        if (!t.file.endsWith(".lz4")) continue;
+                        String path = packed ? null : new File(dir, t.file).getPath();
+                        int tw = c.width, th = c.height;
+                        if (!t.banner) {
+                            long hdr = packed ? RustCore.readPackHeader(i) : RustCore.readBitmapLz4Header(path);
+                            tw = (int) ((hdr >>> 16) & 0xFFFF);
+                            th = (int) (hdr & 0xFFFF);
+                        }
+                        if (tw <= 0 || th <= 0) continue;
+                        Bitmap bmp = Bitmap.createBitmap(tw, th, t.banner ? Bitmap.Config.RGB_565 : Bitmap.Config.ARGB_8888);
+                        int ok = packed ? RustCore.readPackBitmap(i, bmp) : RustCore.readBitmapLz4(path, bmp);
+                        if (ok == 1) {
+                            if (!t.banner) bmp.setHasAlpha(true);
+                            t.image = bmp;
+                        } else {
+                            bmp.recycle();
+                        }
                     }
-                    if (tw <= 0 || th <= 0) continue;
-                    Bitmap bmp = Bitmap.createBitmap(tw, th, t.banner ? Bitmap.Config.RGB_565 : Bitmap.Config.ARGB_8888);
-                    int ok = packed ? RustCore.readPackBitmap(i, bmp) : RustCore.readBitmapLz4(path, bmp);
-                    if (ok == 1) {
-                        if (!t.banner) bmp.setHasAlpha(true);
-                        t.image = bmp;
-                    } else {
-                        bmp.recycle();
-                    }
+                } catch (LinkageError e) {
+                    RustCore.fail(e);
+                } finally {
+                    RustCore.end();
                 }
-            } finally {
-                RustCore.releaseBuffers();
             }
         }
         BitmapFactory.Options opts = null;
+        ByteBuffer[] scratch = new ByteBuffer[1];
         for (Tile t : c.tiles) {
             if (t.image != null || t.file.endsWith(".lz4")) continue;
+            if (t.file.endsWith(".raw")) {
+                t.image = readRaw(new File(dir, t.file), scratch);
+                continue;
+            }
             try {
                 if (opts == null) {
                     opts = new BitmapFactory.Options();
@@ -156,10 +174,24 @@ final class TileStore {
                 do {
                     name = Long.toHexString(System.currentTimeMillis()) + "-" + (written++) + ".lz4";
                 } while (new File(dir, name).exists());
-                if (RustCore.writeBitmapLz4(new File(dir, name).getPath(), soft) == 1) return name;
+                synchronized (RustCore.LOCK) {
+                    RustCore.begin();
+                    try {
+                        if (RustCore.writeBitmapLz4(new File(dir, name).getPath(), soft) == 1) return name;
+                    } catch (LinkageError e) {
+                        RustCore.fail(e);
+                    } finally {
+                        RustCore.end();
+                    }
+                }
             }
-            // Fallback: standard PNG compression.
+            // Without the library: the pixels as they are, so reading them back is one copy and no decoding.
             String name;
+            do {
+                name = Long.toHexString(System.currentTimeMillis()) + "-" + (written++) + ".raw";
+            } while (new File(dir, name).exists());
+            if (writeRaw(new File(dir, name), soft)) return name;
+            // A pixel format the raw file does not carry: standard PNG compression.
             do {
                 name = Long.toHexString(System.currentTimeMillis()) + "-" + (written++) + ".png";
             } while (new File(dir, name).exists());
@@ -172,6 +204,53 @@ final class TileStore {
             return null;
         } finally {
             if (soft != image) soft.recycle();
+        }
+    }
+
+    /** Bytes per pixel of the two formats a raw tile carries, or 0 for any other. */
+    private static int rawFormat(Bitmap.Config config) {
+        return config == Bitmap.Config.RGB_565 ? 2 : config == Bitmap.Config.ARGB_8888 ? 4 : 0;
+    }
+
+    private static boolean writeRaw(File file, Bitmap soft) throws IOException {
+        int format = rawFormat(soft.getConfig()), w = soft.getWidth(), h = soft.getHeight();
+        if (format == 0 || w > 4096 || h > 4096 || soft.getRowBytes() != w * format) return false;
+        ByteBuffer buf = ByteBuffer.allocate(RAW_HEADER + w * h * format);
+        buf.putInt(RAW_MAGIC).putShort((short) w).putShort((short) h).putInt(format);
+        soft.copyPixelsToBuffer(buf);
+        File tmp = new File(file.getPath() + ".tmp");
+        try (FileOutputStream out = new FileOutputStream(tmp)) {
+            out.write(buf.array(), 0, buf.position());
+        }
+        return tmp.renameTo(file);
+    }
+
+    /** The tile {@link #writeRaw} saved, or null when the file is not one. {@code scratch} is reused between tiles. */
+    private static Bitmap readRaw(File file, ByteBuffer[] scratch) {
+        try (FileInputStream in = new FileInputStream(file)) {
+            FileChannel ch = in.getChannel();
+            ByteBuffer head = ByteBuffer.allocate(RAW_HEADER);
+            while (head.hasRemaining()) if (ch.read(head) < 0) return null;
+            // Through Buffer: ByteBuffer's own flip/clear/limit only exist on newer Android than this may run on.
+            ((Buffer) head).flip();
+            if (head.getInt() != RAW_MAGIC) return null;
+            int w = head.getShort() & 0xFFFF, h = head.getShort() & 0xFFFF, format = head.getInt();
+            Bitmap.Config config = format == 2 ? Bitmap.Config.RGB_565 : format == 4 ? Bitmap.Config.ARGB_8888 : null;
+            if (config == null || w == 0 || h == 0 || w > 4096 || h > 4096) return null;
+            int bytes = w * h * format;
+            if (ch.size() != (long) RAW_HEADER + bytes) return null;
+            ByteBuffer px = scratch[0];
+            if (px == null || px.capacity() < bytes) scratch[0] = px = ByteBuffer.allocateDirect(bytes);
+            ((Buffer) px).clear();
+            ((Buffer) px).limit(bytes);
+            while (px.hasRemaining()) if (ch.read(px) < 0) return null;
+            ((Buffer) px).flip();
+            Bitmap bmp = Bitmap.createBitmap(w, h, config);
+            bmp.copyPixelsFromBuffer(px);
+            if (format == 4) bmp.setHasAlpha(true);
+            return bmp;
+        } catch (IOException | RuntimeException e) {
+            return null;
         }
     }
 
@@ -203,12 +282,17 @@ final class TileStore {
             }
             if (!tmp.renameTo(new File(dir, INDEX))) return;
             if (RustCore.AVAILABLE && !tiles.isEmpty()) {
-                try {
-                    StringBuilder manifest = new StringBuilder(dir.getPath());
-                    for (Tile t : tiles) manifest.append('\n').append(t.file);
-                    RustCore.writePackLz4(manifest.toString());
-                } finally {
-                    RustCore.releaseBuffers();
+                StringBuilder manifest = new StringBuilder(dir.getPath());
+                for (Tile t : tiles) manifest.append('\n').append(t.file);
+                synchronized (RustCore.LOCK) {
+                    RustCore.begin();
+                    try {
+                        RustCore.writePackLz4(manifest.toString());
+                    } catch (LinkageError e) {
+                        RustCore.fail(e);
+                    } finally {
+                        RustCore.end();
+                    }
                 }
             }
             Set<String> keep = new HashSet<>();

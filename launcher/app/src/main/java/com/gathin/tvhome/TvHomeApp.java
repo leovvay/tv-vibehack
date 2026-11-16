@@ -7,8 +7,8 @@ import android.os.Process;
 /**
  * Multi-core cold-start preloader for Cortex-A53/A55 TVs: while ActivityThread sets up the window and
  * inflates the root decor on Core 0 (~200 ms between makeApplication and MainActivity.onResume), an idle
- * core warms the variable-font Typefaces, loads libtvhome_core.so + pack.lz4 into RGB_565 buffers, and
- * reads Config + Order off the UI thread.
+ * core warms the variable-font Typefaces, reads the tile store into RGB_565 buffers, and reads
+ * Config + Order off the UI thread.
  */
 public final class TvHomeApp extends Application {
 

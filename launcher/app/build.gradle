@@ -29,9 +29,6 @@ android {
     }
 
     packagingOptions {
-        jniLibs {
-            useLegacyPackaging true
-        }
         resources {
             // Kotlin metadata pulled in by AndroidX's dependencies. This launcher is plain Java and never reads it;
             // leaving it out saves about 14 KB of every install.

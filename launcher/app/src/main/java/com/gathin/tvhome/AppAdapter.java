@@ -326,7 +326,7 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder>
     }
 
     /**
-     * Populates the adapter directly from the preloaded pack.lz4 TileStore with zero PackageManager
+     * Populates the adapter directly from the preloaded TileStore with zero PackageManager
      * binder IPC so Frame 1 renders immediately; MainActivity verifies installed packages after Frame 1.
      */
     boolean restoreFromStore() {
@@ -1251,11 +1251,6 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder>
 
     private static int vividColor(Drawable live) {
         if (live == null) return 0xFF444444;
-        Bitmap src = live instanceof BitmapDrawable ? ((BitmapDrawable) live).getBitmap() : null;
-        if (src != null && src.getConfig() != Bitmap.Config.HARDWARE && RustCore.AVAILABLE) {
-            int fast = RustCore.vivid(src);
-            if (fast != 0) return fast;
-        }
         Bitmap bmp = rasterize(live, 12);
         if (bmp == null) return 0xFF444444;
         int color = vividColor(bmp);
@@ -1264,10 +1259,6 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder>
     }
 
     static int vividColor(Bitmap src) {
-        if (RustCore.AVAILABLE && src.getConfig() != Bitmap.Config.HARDWARE) {
-            int fast = RustCore.vivid(src);
-            if (fast != 0) return fast;
-        }
         int n = 12;
         Bitmap sample = src.getWidth() == n && src.getHeight() == n
                 ? src : Bitmap.createScaledBitmap(src, n, n, false);

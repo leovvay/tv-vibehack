@@ -23,8 +23,8 @@ import java.util.Set;
 
 /**
  * The tiles of the last load, kept on disk so a cold start can show them without opening any other app's APK.
- * A small index plus one file per tile in the cache directory: LZ4 with {@link RustCore}, raw pixels without it,
- * PNG from older stores. Used only from {@link AppLoader}'s worker.
+ * A small index plus one file of raw pixels per tile in the cache directory, so reading a tile back is one
+ * copy and no decoding. Read by {@link TvHomeApp}'s preloader, written by {@link AppAdapter}'s bake worker.
  *
  * A missing, old or damaged store is ignored, never an error: the normal load builds the tiles and saves them again.
  */
@@ -33,7 +33,7 @@ final class TileStore {
     private static final int MAGIC = 0x54494C45;   // "TILE"
     private static final int VERSION = 4;
     private static final String INDEX = "index";
-    /** A tile written without the native library: a 12-byte header, then the pixels as the Bitmap holds them. */
+    /** A tile file: a 12-byte header, then the pixels as the Bitmap holds them. */
     private static final int RAW_MAGIC = 0x54524157;   // "TRAW"
     private static final int RAW_HEADER = 12;
 
@@ -79,7 +79,6 @@ final class TileStore {
     private int written;
 
     TileStore(Context app) {
-        RustCore.arm(app);
         dir = new File(app.getCacheDir(), "tiles");
     }
 
@@ -106,46 +105,12 @@ final class TileStore {
         } catch (IOException | RuntimeException e) {
             return null;
         }
-        // With RustCore, LZ4 tiles decode in ~0.12 ms each directly into RGB_565 / ARGB_8888 software
-        // buffers so Frame 1 never blocks on synchronous RenderProxy::allocateHardwareBitmap uploads;
-        // AppAdapter migrates banners to HARDWARE off the UI thread right after Frame 1.
-        int count = c.tiles.size();
-        if (RustCore.AVAILABLE && count > 0) {
-            synchronized (RustCore.LOCK) {
-                RustCore.begin();
-                try {
-                    boolean packed = RustCore.loadPackLz4(new File(dir, "pack.lz4").getPath()) == count;
-                    for (int i = 0; i < count; i++) {
-                        Tile t = c.tiles.get(i);
-                        if (!t.file.endsWith(".lz4")) continue;
-                        String path = packed ? null : new File(dir, t.file).getPath();
-                        int tw = c.width, th = c.height;
-                        if (!t.banner) {
-                            long hdr = packed ? RustCore.readPackHeader(i) : RustCore.readBitmapLz4Header(path);
-                            tw = (int) ((hdr >>> 16) & 0xFFFF);
-                            th = (int) (hdr & 0xFFFF);
-                        }
-                        if (tw <= 0 || th <= 0) continue;
-                        Bitmap bmp = Bitmap.createBitmap(tw, th, t.banner ? Bitmap.Config.RGB_565 : Bitmap.Config.ARGB_8888);
-                        int ok = packed ? RustCore.readPackBitmap(i, bmp) : RustCore.readBitmapLz4(path, bmp);
-                        if (ok == 1) {
-                            if (!t.banner) bmp.setHasAlpha(true);
-                            t.image = bmp;
-                        } else {
-                            bmp.recycle();
-                        }
-                    }
-                } catch (LinkageError e) {
-                    RustCore.fail(e);
-                } finally {
-                    RustCore.end();
-                }
-            }
-        }
+        // The tiles come back as RGB_565 / ARGB_8888 software bitmaps, so Frame 1 never blocks on a synchronous
+        // RenderProxy::allocateHardwareBitmap upload; AppAdapter moves banners to HARDWARE off the UI thread
+        // right after Frame 1.
         BitmapFactory.Options opts = null;
         ByteBuffer[] scratch = new ByteBuffer[1];
         for (Tile t : c.tiles) {
-            if (t.image != null || t.file.endsWith(".lz4")) continue;
             if (t.file.endsWith(".raw")) {
                 t.image = readRaw(new File(dir, t.file), scratch);
                 continue;
@@ -169,23 +134,7 @@ final class TileStore {
         if (soft == null) return null;
         try {
             if (!dir.isDirectory() && !dir.mkdirs()) return null;
-            if (RustCore.AVAILABLE) {
-                String name;
-                do {
-                    name = Long.toHexString(System.currentTimeMillis()) + "-" + (written++) + ".lz4";
-                } while (new File(dir, name).exists());
-                synchronized (RustCore.LOCK) {
-                    RustCore.begin();
-                    try {
-                        if (RustCore.writeBitmapLz4(new File(dir, name).getPath(), soft) == 1) return name;
-                    } catch (LinkageError e) {
-                        RustCore.fail(e);
-                    } finally {
-                        RustCore.end();
-                    }
-                }
-            }
-            // Without the library: the pixels as they are, so reading them back is one copy and no decoding.
+            // The pixels as they are, so reading them back is one copy and no decoding.
             String name;
             do {
                 name = Long.toHexString(System.currentTimeMillis()) + "-" + (written++) + ".raw";
@@ -281,23 +230,8 @@ final class TileStore {
                 }
             }
             if (!tmp.renameTo(new File(dir, INDEX))) return;
-            if (RustCore.AVAILABLE && !tiles.isEmpty()) {
-                StringBuilder manifest = new StringBuilder(dir.getPath());
-                for (Tile t : tiles) manifest.append('\n').append(t.file);
-                synchronized (RustCore.LOCK) {
-                    RustCore.begin();
-                    try {
-                        RustCore.writePackLz4(manifest.toString());
-                    } catch (LinkageError e) {
-                        RustCore.fail(e);
-                    } finally {
-                        RustCore.end();
-                    }
-                }
-            }
             Set<String> keep = new HashSet<>();
             keep.add(INDEX);
-            keep.add("pack.lz4");
             for (Tile t : tiles) keep.add(t.file);
             File[] files = dir.listFiles();
             if (files == null) return;
